@@ -1,0 +1,6 @@
+#EXTM3U url-tvg="https://raw.githubusercontent.com/rootcoder/epgtv/main/guide.xml.gz,https://i.mjh.nz/PlutoTV/br.xml,https://raw.githubusercontent.com/LITUATUI/M3UPT/refs/heads/main/EPG/epg-rytec-pt.xml.xz,https://raw.githubusercontent.com/LITUATUI/M3UPT/refs/heads/main/EPG/epg-pt.xml.gz,https://raw.githubusercontent.com/limaalef/BrazilTVEPG/refs/heads/main/globo-internacional.xml,https://raw.githubusercontent.com/limaalef/BrazilTVEPG/refs/heads/main/epg.xml,https://raw.githubusercontent.com/limaalef/BrazilTVEPG/refs/heads/main/claro.xml,https://raw.githubusercontent.com/limaalef/BrazilTVEPG/refs/heads/main/vivoplay.xml,https://raw.githubusercontent.com/limaalef/BrazilTVEPG/refs/heads/main/globo.xml"
+
+############################################################################ Informações 
+
+#EXTINF:-1 tvg-logo="https://i.imgur.com/gWFKpfr.png" group-title="TESTE",INTERNAL
+http://127.0.0.1:8080/static/sample.m3u8
