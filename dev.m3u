@@ -3,4 +3,4 @@
 ############################################################################ Informações 
 
 #EXTINF:-1 tvg-logo="https://i.imgur.com/gWFKpfr.png" group-title="TESTE",INTERNAL
-http://127.0.0.1:8080/static/sample.m3u8
+http://192.168.1.149:8080/static/sample.m3u8
