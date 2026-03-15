@@ -30,11 +30,15 @@ const (
 
 var (
 	serverAddr    = flag.String("addr", "127.0.0.1:8081", "server address")
-	mode          = flag.String("mode", "all", "http, small-control, config, layout, command, command-drip, startup or all")
+	mode          = flag.String("mode", "all", "http, small-control, config, layout, command, command-drip, command-poll, startup or all")
 	hostHeader    = flag.String("host", "", "optional Host header for HTTP mode")
 	dripResource  = flag.String("drip-resource", "config.json", "resource fetched over the command-drip channel")
 	dripOutput    = flag.String("drip-output", "", "optional output path for the command-drip payload")
 	dripFrameSize = flag.Int("drip-frame-size", reqControl94, "fixed push frame size expected for command-drip responses")
+	pollResource  = flag.String("poll-resource", "config.json", "resource fetched over the command-poll channel")
+	pollOutput    = flag.String("poll-output", "", "optional output path for the command-poll payload")
+	pollFrameSize = flag.Int("poll-frame-size", reqControl94, "fixed response frame size expected for command-poll responses")
+	pollChunkSize = flag.Int("poll-chunk-size", reqControl94-dripPushHeaderSize, "requested payload bytes per command-poll response")
 )
 
 type chunkResult struct {
@@ -51,6 +55,7 @@ type probeSummary struct {
 	layoutOK        bool
 	commandOK       bool
 	commandDripOK   bool
+	commandPollOK   bool
 }
 
 func main() {
@@ -81,6 +86,10 @@ func main() {
 		if err := runCommandDrip(nil); err != nil {
 			log.Fatal(err)
 		}
+	case "command-poll":
+		if err := runCommandPoll(nil); err != nil {
+			log.Fatal(err)
+		}
 	case "startup":
 		summary := &probeSummary{}
 		if err := runHTTP(summary); err != nil {
@@ -99,6 +108,9 @@ func main() {
 			log.Fatal(err)
 		}
 		if err := runCommandDrip(summary); err != nil {
+			log.Fatal(err)
+		}
+		if err := runCommandPoll(summary); err != nil {
 			log.Fatal(err)
 		}
 		printSummary(summary)
@@ -120,6 +132,9 @@ func main() {
 			log.Fatal(err)
 		}
 		if err := runCommandDrip(summary); err != nil {
+			log.Fatal(err)
+		}
+		if err := runCommandPoll(summary); err != nil {
 			log.Fatal(err)
 		}
 		printSummary(summary)
@@ -307,7 +322,7 @@ func runCommandDrip(summary *probeSummary) error {
 		if _, err := io.ReadFull(conn, frame); err != nil {
 			return fmt.Errorf("read command-drip frame: %w", err)
 		}
-		offset, announcedTotal, chunk, eof, err := parseDripPushFrame(frame)
+		offset, announcedTotal, chunk, eof, err := parseChunkFrame(frame, 'P')
 		if err != nil {
 			return fmt.Errorf("parse command-drip frame: %w", err)
 		}
@@ -344,6 +359,85 @@ func runCommandDrip(summary *probeSummary) error {
 	log.Printf("command-drip preview: %s", previewText(payload, 120))
 	if summary != nil {
 		summary.commandDripOK = true
+	}
+	return nil
+}
+
+func runCommandPoll(summary *probeSummary) error {
+	if *pollFrameSize <= dripPushHeaderSize {
+		return fmt.Errorf("invalid poll frame size %d", *pollFrameSize)
+	}
+	requestedChunk := *pollChunkSize
+	if requestedChunk <= 0 {
+		requestedChunk = *pollFrameSize - dripPushHeaderSize
+	}
+	if requestedChunk > *pollFrameSize-dripPushHeaderSize {
+		requestedChunk = *pollFrameSize - dripPushHeaderSize
+	}
+
+	var (
+		total      int
+		nextOffset int
+		frames     int
+		payload    []byte
+	)
+	for {
+		conn, err := net.DialTimeout("tcp", *serverAddr, 2*time.Second)
+		if err != nil {
+			return fmt.Errorf("dial command-poll offset=%d: %w", nextOffset, err)
+		}
+
+		req := makeCommandPollRequest("device-123", *pollResource, nextOffset, requestedChunk)
+		if _, err := conn.Write(req); err != nil {
+			conn.Close()
+			return fmt.Errorf("write command-poll offset=%d: %w", nextOffset, err)
+		}
+
+		frame := make([]byte, *pollFrameSize)
+		if _, err := io.ReadFull(conn, frame); err != nil {
+			conn.Close()
+			return fmt.Errorf("read command-poll offset=%d: %w", nextOffset, err)
+		}
+		_ = conn.Close()
+
+		offset, announcedTotal, chunk, eof, err := parseChunkFrame(frame, 'Y')
+		if err != nil {
+			return fmt.Errorf("parse command-poll frame offset=%d: %w", nextOffset, err)
+		}
+		if total == 0 {
+			total = announcedTotal
+			payload = make([]byte, total)
+			log.Printf("command-poll start resource=%q total=%d chunk=%d frame=%d", *pollResource, total, requestedChunk, *pollFrameSize)
+		}
+		if announcedTotal != total {
+			return fmt.Errorf("command-poll total changed: got %d want %d", announcedTotal, total)
+		}
+		if offset != nextOffset {
+			return fmt.Errorf("command-poll out of order: got offset=%d want=%d", offset, nextOffset)
+		}
+		copy(payload[offset:], chunk)
+		nextOffset += len(chunk)
+		frames++
+		if eof {
+			break
+		}
+	}
+	if nextOffset != total {
+		return fmt.Errorf("command-poll truncated: wrote %d of %d", nextOffset, total)
+	}
+
+	outPath := *pollOutput
+	if outPath == "" {
+		outPath = outputPathForResource("command_poll_", *pollResource)
+	}
+	if err := os.WriteFile(outPath, payload, 0o644); err != nil {
+		return fmt.Errorf("write command-poll payload: %w", err)
+	}
+
+	log.Printf("command-poll rebuilt length=%d frames=%d written=%s", len(payload), frames, outPath)
+	log.Printf("command-poll preview: %s", previewText(payload, 120))
+	if summary != nil {
+		summary.commandPollOK = true
 	}
 	return nil
 }
@@ -482,12 +576,23 @@ func makeCommandDripRequest(device, resource string) []byte {
 	return frame
 }
 
-func parseDripPushFrame(frame []byte) (offset, total int, payload []byte, eof bool, err error) {
+func makeCommandPollRequest(device, resource string, offset, want int) []byte {
+	frame := bytes.Repeat([]byte{0}, reqControl94)
+	frame[0] = 'O'
+	copy(frame[1:33], []byte(device))
+	copy(frame[33:65], []byte(resource))
+	binary.BigEndian.PutUint32(frame[65:69], uint32(offset))
+	binary.BigEndian.PutUint32(frame[69:73], uint32(want))
+	copy(frame[73:], []byte("command-poll"))
+	return frame
+}
+
+func parseChunkFrame(frame []byte, wantOpcode byte) (offset, total int, payload []byte, eof bool, err error) {
 	if len(frame) < dripPushHeaderSize {
 		return 0, 0, nil, false, fmt.Errorf("frame too short: %d", len(frame))
 	}
-	if frame[0] != 'P' {
-		return 0, 0, nil, false, fmt.Errorf("unexpected drip opcode %q", frame[0])
+	if frame[0] != wantOpcode {
+		return 0, 0, nil, false, fmt.Errorf("unexpected frame opcode %q want %q", frame[0], wantOpcode)
 	}
 	total = int(binary.BigEndian.Uint32(frame[2:6]))
 	offset = int(binary.BigEndian.Uint32(frame[6:10]))
@@ -504,12 +609,16 @@ func parseDripPushFrame(frame []byte) (offset, total int, payload []byte, eof bo
 }
 
 func outputPathForDripResource(resource string) string {
+	return outputPathForResource("command_drip_", resource)
+}
+
+func outputPathForResource(prefix, resource string) string {
 	name := strings.TrimSpace(resource)
 	if name == "" {
 		name = "config.json"
 	}
 	replacer := strings.NewReplacer("/", "_", "\\", "_", " ", "_")
-	return "command_drip_" + replacer.Replace(name)
+	return prefix + replacer.Replace(name)
 }
 
 func previewText(b []byte, limit int) string {
@@ -527,7 +636,7 @@ func printSummary(summary *probeSummary) {
 		return
 	}
 	log.Printf(
-		"summary http_direct=%d http_intercepted=%d small_control=%t config=%t layout=%t command=%t command_drip=%t",
+		"summary http_direct=%d http_intercepted=%d small_control=%t config=%t layout=%t command=%t command_drip=%t command_poll=%t",
 		summary.httpDirect,
 		summary.httpIntercepted,
 		summary.smallControlOK,
@@ -535,6 +644,7 @@ func printSummary(summary *probeSummary) {
 		summary.layoutOK,
 		summary.commandOK,
 		summary.commandDripOK,
+		summary.commandPollOK,
 	)
 	if summary.httpIntercepted > 0 && summary.configOK && summary.layoutOK && summary.commandOK {
 		log.Printf("summary verdict: HTTP foi interceptado pelo captive portal, mas o protocolo binario atingiu a origem com sucesso")
