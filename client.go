@@ -22,14 +22,19 @@ const (
 	reqLayout92  = 92
 	reqControl94 = 94
 
-	layoutStep = 12288
-	layoutSize = 60415
+	layoutStep              = 12288
+	layoutSize              = 60415
+	dripPushHeaderSize      = 12
+	dripPushFlagEOF    byte = 1 << 0
 )
 
 var (
-	serverAddr = flag.String("addr", "127.0.0.1:8081", "server address")
-	mode       = flag.String("mode", "all", "http, small-control, config, layout, command, startup or all")
-	hostHeader = flag.String("host", "", "optional Host header for HTTP mode")
+	serverAddr    = flag.String("addr", "127.0.0.1:8081", "server address")
+	mode          = flag.String("mode", "all", "http, small-control, config, layout, command, command-drip, startup or all")
+	hostHeader    = flag.String("host", "", "optional Host header for HTTP mode")
+	dripResource  = flag.String("drip-resource", "config.json", "resource fetched over the command-drip channel")
+	dripOutput    = flag.String("drip-output", "", "optional output path for the command-drip payload")
+	dripFrameSize = flag.Int("drip-frame-size", reqControl94, "fixed push frame size expected for command-drip responses")
 )
 
 type chunkResult struct {
@@ -38,68 +43,92 @@ type chunkResult struct {
 	err    error
 }
 
+type probeSummary struct {
+	httpIntercepted int
+	httpDirect      int
+	smallControlOK  bool
+	configOK        bool
+	layoutOK        bool
+	commandOK       bool
+	commandDripOK   bool
+}
+
 func main() {
 	flag.Parse()
 
 	switch *mode {
 	case "http":
-		if err := runHTTP(); err != nil {
+		if err := runHTTP(nil); err != nil {
 			log.Fatal(err)
 		}
 	case "small-control":
-		if err := runSmallControl(); err != nil {
+		if err := runSmallControl(nil); err != nil {
 			log.Fatal(err)
 		}
 	case "config":
-		if err := runConfig(); err != nil {
+		if err := runConfig(nil); err != nil {
 			log.Fatal(err)
 		}
 	case "layout":
-		if err := runLayout(); err != nil {
+		if err := runLayout(nil); err != nil {
 			log.Fatal(err)
 		}
 	case "command":
-		if err := runCommand(); err != nil {
+		if err := runCommand(nil); err != nil {
+			log.Fatal(err)
+		}
+	case "command-drip":
+		if err := runCommandDrip(nil); err != nil {
 			log.Fatal(err)
 		}
 	case "startup":
-		if err := runHTTP(); err != nil {
+		summary := &probeSummary{}
+		if err := runHTTP(summary); err != nil {
 			log.Fatal(err)
 		}
-		if err := runSmallControl(); err != nil {
+		if err := runSmallControl(summary); err != nil {
 			log.Fatal(err)
 		}
-		if err := runConfig(); err != nil {
+		if err := runConfig(summary); err != nil {
 			log.Fatal(err)
 		}
-		if err := runLayout(); err != nil {
+		if err := runLayout(summary); err != nil {
 			log.Fatal(err)
 		}
-		if err := runCommand(); err != nil {
+		if err := runCommand(summary); err != nil {
 			log.Fatal(err)
 		}
+		if err := runCommandDrip(summary); err != nil {
+			log.Fatal(err)
+		}
+		printSummary(summary)
 	case "all":
-		if err := runHTTP(); err != nil {
+		summary := &probeSummary{}
+		if err := runHTTP(summary); err != nil {
 			log.Fatal(err)
 		}
-		if err := runSmallControl(); err != nil {
+		if err := runSmallControl(summary); err != nil {
 			log.Fatal(err)
 		}
-		if err := runConfig(); err != nil {
+		if err := runConfig(summary); err != nil {
 			log.Fatal(err)
 		}
-		if err := runLayout(); err != nil {
+		if err := runLayout(summary); err != nil {
 			log.Fatal(err)
 		}
-		if err := runCommand(); err != nil {
+		if err := runCommand(summary); err != nil {
 			log.Fatal(err)
 		}
+		if err := runCommandDrip(summary); err != nil {
+			log.Fatal(err)
+		}
+		printSummary(summary)
 	default:
 		log.Fatalf("unknown mode %q", *mode)
 	}
 }
 
-func runHTTP() error {
+func runHTTP(summary *probeSummary) error {
 	baseURL := "http://" + *serverAddr
 	client := &http.Client{Timeout: 3 * time.Second}
 	for _, path := range []string{"/", "/_lab/config.json", "/healthz"} {
@@ -119,12 +148,20 @@ func runHTTP() error {
 		if err != nil {
 			return fmt.Errorf("read http body %s: %w", path, err)
 		}
-		log.Printf("http %s -> %d %s", path, resp.StatusCode, previewText(body, 96))
+		intercepted := looksLikeCaptive(body)
+		if summary != nil {
+			if intercepted {
+				summary.httpIntercepted++
+			} else {
+				summary.httpDirect++
+			}
+		}
+		log.Printf("http %s -> %d captive=%t %s", path, resp.StatusCode, intercepted, previewText(body, 96))
 	}
 	return nil
 }
 
-func runSmallControl() error {
+func runSmallControl(summary *probeSummary) error {
 	if err := sendFixedReply(makeRegisterRequest("boot-register"), 36, "control82/register"); err != nil {
 		return err
 	}
@@ -134,10 +171,13 @@ func runSmallControl() error {
 	if err := sendFixedReply(makeTicketRequest("boot-ticket"), 38, "control82/ticket"); err != nil {
 		return err
 	}
+	if summary != nil {
+		summary.smallControlOK = true
+	}
 	return nil
 }
 
-func runConfig() error {
+func runConfig(summary *probeSummary) error {
 	conn, err := net.DialTimeout("tcp", *serverAddr, 2*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial config: %w", err)
@@ -157,10 +197,13 @@ func runConfig() error {
 
 	log.Printf("config response body=%d bytes sha-like=%x", len(payload), payload[:min(8, len(payload))])
 	log.Printf("config preview: %s", previewText(payload, 96))
+	if summary != nil {
+		summary.configOK = true
+	}
 	return nil
 }
 
-func runLayout() error {
+func runLayout(summary *probeSummary) error {
 	offsets := buildOffsets(layoutSize, layoutStep)
 	results := make(chan chunkResult, len(offsets))
 
@@ -191,10 +234,13 @@ func runLayout() error {
 
 	log.Printf("layout rebuilt length=%d written=%s", len(layout), outPath)
 	log.Printf("layout preview: %s", previewText(layout, 120))
+	if summary != nil {
+		summary.layoutOK = true
+	}
 	return nil
 }
 
-func runCommand() error {
+func runCommand(summary *probeSummary) error {
 	conn, err := net.DialTimeout("tcp", *serverAddr, 2*time.Second)
 	if err != nil {
 		return fmt.Errorf("dial command: %w", err)
@@ -218,6 +264,87 @@ func runCommand() error {
 		return fmt.Errorf("read command push: %w", err)
 	}
 	log.Printf("command push len=%d preview=%q", len(push), strings.TrimRight(string(push), "\x00"))
+	if summary != nil {
+		summary.commandOK = true
+	}
+	return nil
+}
+
+func runCommandDrip(summary *probeSummary) error {
+	conn, err := net.DialTimeout("tcp", *serverAddr, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("dial command-drip: %w", err)
+	}
+	defer conn.Close()
+
+	req := makeCommandDripRequest("device-123", *dripResource)
+	log.Printf("command-drip request len=%d resource=%q", len(req), *dripResource)
+	if _, err := conn.Write(req); err != nil {
+		return fmt.Errorf("write command-drip request: %w", err)
+	}
+
+	ack := make([]byte, 31)
+	if _, err := io.ReadFull(conn, ack); err != nil {
+		return fmt.Errorf("read command-drip ack: %w", err)
+	}
+	ackText := strings.TrimRight(string(ack), "\x00")
+	log.Printf("command-drip ack len=%d preview=%q", len(ack), ackText)
+	if strings.Contains(strings.ToUpper(ackText), "ERR|") {
+		return fmt.Errorf("command-drip rejected: %s", ackText)
+	}
+	if *dripFrameSize <= dripPushHeaderSize {
+		return fmt.Errorf("invalid drip frame size %d", *dripFrameSize)
+	}
+
+	var (
+		total      int
+		nextOffset int
+		frames     int
+		payload    []byte
+	)
+	for {
+		frame := make([]byte, *dripFrameSize)
+		if _, err := io.ReadFull(conn, frame); err != nil {
+			return fmt.Errorf("read command-drip frame: %w", err)
+		}
+		offset, announcedTotal, chunk, eof, err := parseDripPushFrame(frame)
+		if err != nil {
+			return fmt.Errorf("parse command-drip frame: %w", err)
+		}
+		if total == 0 {
+			total = announcedTotal
+			payload = make([]byte, total)
+		}
+		if announcedTotal != total {
+			return fmt.Errorf("command-drip total changed: got %d want %d", announcedTotal, total)
+		}
+		if offset != nextOffset {
+			return fmt.Errorf("command-drip out of order: got offset=%d want=%d", offset, nextOffset)
+		}
+		copy(payload[offset:], chunk)
+		nextOffset += len(chunk)
+		frames++
+		if eof {
+			break
+		}
+	}
+	if nextOffset != total {
+		return fmt.Errorf("command-drip truncated: wrote %d of %d", nextOffset, total)
+	}
+
+	outPath := *dripOutput
+	if outPath == "" {
+		outPath = outputPathForDripResource(*dripResource)
+	}
+	if err := os.WriteFile(outPath, payload, 0o644); err != nil {
+		return fmt.Errorf("write command-drip payload: %w", err)
+	}
+
+	log.Printf("command-drip rebuilt length=%d frames=%d written=%s", len(payload), frames, outPath)
+	log.Printf("command-drip preview: %s", previewText(payload, 120))
+	if summary != nil {
+		summary.commandDripOK = true
+	}
 	return nil
 }
 
@@ -346,9 +473,72 @@ func makeCommandRequest(device, user string) []byte {
 	return frame
 }
 
+func makeCommandDripRequest(device, resource string) []byte {
+	frame := bytes.Repeat([]byte{0}, reqControl94)
+	frame[0] = 'D'
+	copy(frame[1:33], []byte(device))
+	copy(frame[33:65], []byte(resource))
+	copy(frame[65:], []byte("command-drip"))
+	return frame
+}
+
+func parseDripPushFrame(frame []byte) (offset, total int, payload []byte, eof bool, err error) {
+	if len(frame) < dripPushHeaderSize {
+		return 0, 0, nil, false, fmt.Errorf("frame too short: %d", len(frame))
+	}
+	if frame[0] != 'P' {
+		return 0, 0, nil, false, fmt.Errorf("unexpected drip opcode %q", frame[0])
+	}
+	total = int(binary.BigEndian.Uint32(frame[2:6]))
+	offset = int(binary.BigEndian.Uint32(frame[6:10]))
+	size := int(binary.BigEndian.Uint16(frame[10:12]))
+	if size > len(frame)-dripPushHeaderSize {
+		return 0, 0, nil, false, fmt.Errorf("invalid drip chunk size %d", size)
+	}
+	if offset < 0 || offset+size > total {
+		return 0, 0, nil, false, fmt.Errorf("invalid drip offset=%d size=%d total=%d", offset, size, total)
+	}
+	eof = frame[1]&dripPushFlagEOF != 0
+	payload = append([]byte(nil), frame[12:12+size]...)
+	return offset, total, payload, eof, nil
+}
+
+func outputPathForDripResource(resource string) string {
+	name := strings.TrimSpace(resource)
+	if name == "" {
+		name = "config.json"
+	}
+	replacer := strings.NewReplacer("/", "_", "\\", "_", " ", "_")
+	return "command_drip_" + replacer.Replace(name)
+}
+
 func previewText(b []byte, limit int) string {
 	s := strings.ReplaceAll(string(b[:min(limit, len(b))]), "\n", " ")
 	return strings.TrimSpace(s)
+}
+
+func looksLikeCaptive(body []byte) bool {
+	text := strings.ToLower(string(body[:min(len(body), 512)]))
+	return strings.Contains(text, "captive") || strings.Contains(text, "captivews/init") || strings.Contains(text, "http-equiv=\"refresh\"")
+}
+
+func printSummary(summary *probeSummary) {
+	if summary == nil {
+		return
+	}
+	log.Printf(
+		"summary http_direct=%d http_intercepted=%d small_control=%t config=%t layout=%t command=%t command_drip=%t",
+		summary.httpDirect,
+		summary.httpIntercepted,
+		summary.smallControlOK,
+		summary.configOK,
+		summary.layoutOK,
+		summary.commandOK,
+		summary.commandDripOK,
+	)
+	if summary.httpIntercepted > 0 && summary.configOK && summary.layoutOK && summary.commandOK {
+		log.Printf("summary verdict: HTTP foi interceptado pelo captive portal, mas o protocolo binario atingiu a origem com sucesso")
+	}
 }
 
 func min(a, b int) int {
